@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Clear modifier keys left pressed by an interrupted Deskflow XTEST session."""
+
+import re
+import subprocess
+import sys
+import time
+
+from Xlib import X, display
+from Xlib.ext import xtest
+
+
+CHECK_INTERVAL = 3
+
+
+def xinput(*args):
+    try:
+        return subprocess.run(
+            ["xinput", *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout
+    except Exception:
+        return ""
+
+
+def device_ids():
+    """Return the XTEST keyboard ID and physical keyboard IDs."""
+    xtest_id = None
+    physical = []
+    for line in xinput("list").splitlines():
+        match = re.search(r"id=(\d+)\s+\[slave\s+keyboard", line)
+        if not match:
+            continue
+        device_id = int(match.group(1))
+        name = line.lower()
+        if "xtest" in name:
+            xtest_id = device_id
+        elif not any(
+            ignored in name
+            for ignored in ("video bus", "power button", "wmi hotkeys")
+        ):
+            physical.append(device_id)
+    return xtest_id, physical
+
+
+def keys_down(device_id):
+    return {
+        int(match)
+        for match in re.findall(
+            r"key\[(\d+)\]=down", xinput("query-state", str(device_id))
+        )
+    }
+
+
+def modifier_keycodes(xdisplay):
+    modifiers = set()
+    for keys in xdisplay.get_modifier_mapping():
+        modifiers.update(key for key in keys if key)
+    return modifiers
+
+
+def find_stuck(xdisplay, xtest_id, physical):
+    if xtest_id is None:
+        return []
+    held_physically = set()
+    for device_id in physical:
+        held_physically |= keys_down(device_id)
+    return sorted(
+        (keys_down(xtest_id) & modifier_keycodes(xdisplay)) - held_physically
+    )
+
+
+def release(xdisplay, keycodes):
+    for keycode in keycodes:
+        xtest.fake_input(xdisplay, X.KeyRelease, keycode)
+    xdisplay.sync()
+
+
+def sweep(xdisplay, xtest_id, physical, verbose=True):
+    stuck = find_stuck(xdisplay, xtest_id, physical)
+    if not stuck:
+        return False
+    names = [xdisplay.keycode_to_keysym(keycode, 0) for keycode in stuck]
+    release(xdisplay, stuck)
+    time.sleep(0.3)
+    remaining = find_stuck(xdisplay, xtest_id, physical)
+    if remaining:
+        for _ in range(3):
+            release(xdisplay, remaining)
+            time.sleep(0.2)
+            remaining = find_stuck(xdisplay, xtest_id, physical)
+            if not remaining:
+                break
+    if verbose:
+        from Xlib import XK
+
+        pretty = ", ".join(
+            XK.keysym_to_string(keysym) or str(keysym) for keysym in names
+        )
+        print(
+            f"Cleared stuck modifier keys: {pretty}"
+            + (f" (still held: {remaining})" if remaining else ""),
+            flush=True,
+        )
+    return True
+
+
+def main():
+    xdisplay = display.Display()
+    xtest_id, physical = device_ids()
+    argument = sys.argv[1] if len(sys.argv) > 1 else ""
+
+    if argument == "--status":
+        stuck = find_stuck(xdisplay, xtest_id, physical)
+        print(f"XTEST keyboard: {xtest_id}")
+        print(f"Physical keyboards: {physical}")
+        print(f"Stuck modifiers: {stuck if stuck else '(none)'}")
+        return
+
+    if argument != "--watch":
+        if not sweep(xdisplay, xtest_id, physical):
+            print("No stuck modifier keys")
+        return
+
+    while True:
+        try:
+            sweep(xdisplay, xtest_id, physical)
+        except Exception:
+            pass
+        time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

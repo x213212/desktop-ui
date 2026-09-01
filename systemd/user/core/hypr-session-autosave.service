@@ -1,0 +1,33 @@
+[Unit]
+Description=Low-overhead Hyprland application session autosave
+Documentation=https://wiki.hypr.land/IPC/
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/desktop-ui/host.env
+ExecStart=%h/.local/bin/hypr-session-state daemon --quiet
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+Nice=15
+CPUWeight=10
+CPUQuota=2%
+IOSchedulingClass=idle
+IOWeight=10
+MemoryHigh=48M
+MemoryMax=64M
+TasksMax=16
+UMask=0077
+NoNewPrivileges=true
+StateDirectory=hypr-session
+StateDirectoryMode=0700
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+Environment=PYTHONDONTWRITEBYTECODE=1

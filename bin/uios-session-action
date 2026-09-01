@@ -1,0 +1,279 @@
+#!/usr/bin/python3
+"""Serialize desktop checkpoints with suspend and session termination."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+HOME = Path.home()
+SESSION_STATE = HOME / ".local/bin/hypr-session-state"
+SCREEN_LOCK = HOME / ".local/bin/secure-screen-lock"
+AUTOSAVE_UNIT = "hypr-session-autosave.service"
+RECOVERY_DELAY_SECONDS = 12
+CHECKPOINT_SETTLE_SECONDS = 0.8
+CHECKPOINT_QUIET_SECONDS = 0.2
+
+
+def run(command: list[str], timeout: float) -> int:
+    try:
+        return subprocess.run(command, check=False, timeout=timeout).returncode
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"uios-session-action: {command[0]} failed: {error}", file=sys.stderr)
+        return 1
+
+
+def client_topology() -> tuple[tuple[object, ...], ...] | None:
+    """Read only stable compositor identity; ignore rapidly changing titles."""
+    try:
+        result = subprocess.run(
+            ["hyprctl", "clients", "-j"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=1,
+        )
+        if result.returncode != 0:
+            return None
+        clients = json.loads(result.stdout)
+        return tuple(
+            sorted(
+                (
+                    str(client.get("address", "")),
+                    str(client.get("class", "")),
+                    str((client.get("workspace") or {}).get("name", "")),
+                    bool(client.get("mapped", False)),
+                    bool(client.get("hidden", False)),
+                )
+                for client in clients
+                if isinstance(client, dict)
+            )
+        )
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+
+
+def settle_client_topology() -> None:
+    """Let a just-issued close reach Hyprland before the final checkpoint."""
+    deadline = time.monotonic() + CHECKPOINT_SETTLE_SECONDS
+    previous: tuple[tuple[object, ...], ...] | None = None
+    quiet_since: float | None = None
+    while time.monotonic() < deadline:
+        current = client_topology()
+        now = time.monotonic()
+        if current is None:
+            return
+        if current == previous:
+            if quiet_since is not None and now - quiet_since >= CHECKPOINT_QUIET_SECONDS:
+                return
+        else:
+            previous = current
+            quiet_since = now
+        time.sleep(0.05)
+
+
+def checkpoint(*, stop_autosave: bool) -> None:
+    # atomic_json() in hypr-session-state fsyncs both the file and its parent
+    # directory. If a protected restore is incomplete it deliberately keeps
+    # the last verified snapshot instead of overwriting it.
+    if stop_autosave:
+        settle_client_topology()
+    run([str(SESSION_STATE), "save", "--quiet"], timeout=10)
+    if stop_autosave:
+        # Stop while all applications are still queryable. The daemon's own
+        # SIGTERM checkpoint is therefore either identical or newer, and no
+        # later half-empty shutdown state can replace it.
+        run(
+            ["systemctl", "--user", "stop", AUTOSAVE_UNIT],
+            timeout=15,
+        )
+
+
+def restart_autosave() -> None:
+    run(["systemctl", "--user", "start", AUTOSAVE_UNIT], timeout=10)
+
+
+def dpms(state: str) -> None:
+    """Blank or restore the panels. Best effort; never fatal.
+
+    Nothing in this desktop binds the lid switch to DPMS, so between the lid
+    closing and hyprlock actually owning the screen (~1.8s of process start)
+    the bare desktop stayed rendered. Reopening the lid inside that window
+    showed it. Blanking first closes that hole; Hyprland's
+    key_press_enables_dpms/mouse_move_enables_dpms are the backstop if the
+    restore below is ever missed.
+    """
+    action = "disable" if state == "off" else "enable"
+    for command in (
+        ["hyprctl", "dispatch", f'hl.dsp.dpms({{ action = "{action}" }})'],
+        ["hyprctl", "dispatch", "dpms", "off" if state == "off" else "on"],
+    ):
+        try:
+            if subprocess.run(command, check=False, timeout=2,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+
+def lid_is_open() -> bool:
+    """Return true only for an authoritative "open" answer."""
+    try:
+        result = subprocess.run(
+            [str(HOME / ".local/bin/p14s-lid-debounce"), "--check"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and "open" in result.stdout
+
+
+def secure_before_sleep() -> bool:
+    """Never enter sleep unless the compositor has a verified lock owner."""
+    result = run([str(SCREEN_LOCK), "--mark-session"], timeout=6)
+    if result != 0:
+        print(
+            "uios-session-action: screen lock failed; refusing to sleep",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def schedule_autosave_recovery() -> None:
+    """Recover if logind accepted an action that is later cancelled."""
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "_recover_autosave"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        print(f"uios-session-action: recovery scheduling failed: {error}", file=sys.stderr)
+
+
+def system_action(primary: list[str], fallback: list[str] | None = None) -> int:
+    result = run(primary, timeout=15)
+    if result != 0 and fallback:
+        result = run(fallback, timeout=15)
+    return result
+
+
+def main() -> int:
+    if sys.argv[1:] == ["_recover_autosave"]:
+        time.sleep(RECOVERY_DELAY_SECONDS)
+        # The helper inherits the current Hyprland signature. A completed
+        # logout/reboot makes this probe fail, while a cancelled action leaves
+        # the same live compositor and safely re-enables checkpointing.
+        if run(["hyprctl", "monitors", "-j"], timeout=5) == 0:
+            restart_autosave()
+        return 0
+
+    argv = sys.argv[1:]
+    # The lid daemon passes --if-lid-still-closed so that a suspend it asked
+    # for is abandoned if the user reopened the lid meanwhile. An idle-timeout
+    # suspend must NOT take that escape hatch: the lid is open by definition.
+    lid_only = "--if-lid-still-closed" in argv
+    if lid_only:
+        argv.remove("--if-lid-still-closed")
+    if len(argv) != 1:
+        print(
+            "usage: uios-session-action [--if-lid-still-closed] "
+            "{suspend|hibernate|logout|poweroff|reboot|firmware}",
+            file=sys.stderr,
+        )
+        return 2
+
+    action = argv[0]
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    try:
+        action_lock = (runtime_dir / "uios-session-action.lock").open("w", encoding="utf-8")
+        fcntl.flock(action_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Power buttons and keybindings can generate duplicate clicks. The
+        # first serialized action owns the checkpoint and system transition.
+        return 0
+    except OSError as error:
+        print(f"uios-session-action: cannot acquire action lock: {error}", file=sys.stderr)
+        return 1
+
+    if action == "suspend":
+        # Blank first, then lock, then checkpoint. hyprlock needs ~1.8s to
+        # start and own the screen; blanking is immediate, so the desktop is
+        # never visible in between.
+        if lid_only:
+            dpms("off")
+        if not secure_before_sleep():
+            if lid_only:
+                dpms("on")
+            return 1
+        checkpoint(stop_autosave=False)
+        # The lid may have been reopened while we were locking and saving.
+        # systemctl suspend is asynchronous and nothing re-checks afterwards,
+        # so without this the machine slept anyway and the user waited out a
+        # pointless suspend/resume cycle.
+        if lid_only and lid_is_open():
+            print("uios-session-action: lid reopened; suspend cancelled", file=sys.stderr)
+            dpms("on")
+            return 0
+        return system_action(
+            ["systemctl", "suspend"],
+            ["loginctl", "suspend"],
+        )
+    if action == "hibernate":
+        checkpoint(stop_autosave=False)
+        if not secure_before_sleep():
+            return 1
+        return system_action(
+            ["systemctl", "hibernate"],
+            ["loginctl", "hibernate"],
+        )
+
+    actions: dict[str, tuple[list[str], list[str] | None]] = {
+        "logout": (
+            ["uwsm", "stop"],
+            ["hyprctl", "dispatch", "hl.dsp.exit()"],
+        ),
+        "poweroff": (
+            ["systemctl", "poweroff"],
+            ["loginctl", "poweroff"],
+        ),
+        "reboot": (
+            ["systemctl", "reboot"],
+            ["loginctl", "reboot"],
+        ),
+        "firmware": (
+            ["systemctl", "reboot", "--firmware-setup"],
+            ["loginctl", "reboot", "--firmware-setup"],
+        ),
+    }
+    command = actions.get(action)
+    if command is None:
+        print(f"uios-session-action: unknown action: {action}", file=sys.stderr)
+        return 2
+
+    checkpoint(stop_autosave=True)
+    if action != "logout":
+        schedule_autosave_recovery()
+    result = system_action(*command)
+    if result != 0:
+        # A rejected/cancelled action must not leave the live desktop without
+        # its low-overhead checkpoint daemon.
+        restart_autosave()
+    return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

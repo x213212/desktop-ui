@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Maintain a small, atomic weather cache for the independent lock screen."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+import math
+import os
+from pathlib import Path
+import tempfile
+import urllib.parse
+import urllib.request
+
+
+FRESH_SECONDS = 8 * 60
+STALE_SECONDS = 20 * 60
+CACHE = (
+    Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    / "hyprlock/weather.txt"
+)
+RAIN_INTERVAL_MM = 0.1
+RAIN_CODE_INTERVAL_MM = 0.05
+RAIN_HOUR_MM = 0.2
+RAIN_INTERVAL_SECONDS = 15 * 60
+RAIN_FORECAST_SECONDS = 60 * 60
+UNCONFIGURED_TEXT = (
+    "目前位置 · 天氣位置尚未設定\n"
+    "體感 -- · 濕度 -- · 風速 -- · 近 15 分鐘雨量 --\n"
+    "能見度 -- · 氣壓 -- · 日出 -- · 日落 -- · 更新 --\n"
+    "cloud\n"
+)
+
+
+def unavailable_text(city: str) -> str:
+    """Return a non-animated cache when forecast data is too old to trust."""
+    return (
+        f"{city} · 天氣資料暫時無法更新\n"
+        "體感 -- · 濕度 -- · 風速 -- · 近 15 分鐘雨量 --\n"
+        "能見度 -- · 氣壓 -- · 日出 -- · 日落 -- · 更新失敗\n"
+        "cloud\n"
+    )
+
+
+def configured_location() -> tuple[float, float, str] | None:
+    """Return a private location from the service environment, if configured."""
+    latitude_text = os.environ.get("UIOS_WEATHER_LATITUDE", "").strip()
+    longitude_text = os.environ.get("UIOS_WEATHER_LONGITUDE", "").strip()
+    if not latitude_text or not longitude_text:
+        return None
+    latitude = float(latitude_text)
+    longitude = float(longitude_text)
+    if not math.isfinite(latitude) or not -90 <= latitude <= 90:
+        raise ValueError("UIOS_WEATHER_LATITUDE must be between -90 and 90")
+    if not math.isfinite(longitude) or not -180 <= longitude <= 180:
+        raise ValueError("UIOS_WEATHER_LONGITUDE must be between -180 and 180")
+    city = os.environ.get("UIOS_WEATHER_CITY", "").strip() or "目前位置"
+    return latitude, longitude, city
+
+
+def description(code: int) -> str:
+    if code == 0:
+        return "晴朗"
+    if code <= 2:
+        return "局部多雲"
+    if code == 3:
+        return "陰天"
+    if code in {45, 48}:
+        return "有霧"
+    if 51 <= code <= 57:
+        return "毛毛雨"
+    if 61 <= code <= 67:
+        return "下雨"
+    if 71 <= code <= 77:
+        return "降雪"
+    if 80 <= code <= 82:
+        return "陣雨"
+    if 85 <= code <= 86:
+        return "陣雪"
+    if code >= 95:
+        return "雷雨"
+    return "天氣不明"
+
+
+def short_time(value: object) -> str:
+    text = str(value or "")
+    return text.split("T", 1)[1] if "T" in text else text
+
+
+def numeric(value: object) -> float:
+    """Return a finite API number, treating missing model data as zero."""
+    try:
+        result = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if math.isfinite(result) else 0.0
+
+
+def is_rain_code(value: object) -> bool:
+    """Return whether a WMO code represents liquid rain or a thunderstorm."""
+    try:
+        code = int(value or 0)
+    except (TypeError, ValueError):
+        return False
+    return 51 <= code <= 57 or 61 <= code <= 67 or 80 <= code <= 82 or 95 <= code <= 99
+
+
+def api_time(value: object) -> datetime | None:
+    """Parse Open-Meteo's local ISO timestamps without assuming a UTC offset."""
+    try:
+        return datetime.fromisoformat(str(value or ""))
+    except ValueError:
+        return None
+
+
+def api_local_now(payload: dict[str, object], now: datetime | None) -> datetime:
+    """Return a naive datetime on the forecast location's local timeline."""
+    offset = timedelta(seconds=numeric(payload.get("utc_offset_seconds")))
+    if now is None:
+        return (datetime.now(timezone.utc) + offset).replace(tzinfo=None)
+    if now.tzinfo is not None:
+        return now.astimezone(timezone(offset)).replace(tzinfo=None)
+    return now
+
+
+def forecast_samples(
+    times: list[object], now: datetime
+) -> list[tuple[int, float, datetime]]:
+    """Return interval overlap with the rolling hour after ``now``."""
+    horizon_end = now + timedelta(seconds=RAIN_FORECAST_SECONDS)
+    result: list[tuple[int, float, datetime]] = []
+    for index, value in enumerate(times):
+        interval_end = api_time(value)
+        if interval_end is None:
+            continue
+        interval_start = interval_end - timedelta(seconds=RAIN_INTERVAL_SECONDS)
+        overlap_start = max(now, interval_start)
+        overlap_end = min(horizon_end, interval_end)
+        overlap_seconds = (overlap_end - overlap_start).total_seconds()
+        if overlap_seconds > 0:
+            result.append(
+                (index, overlap_seconds / RAIN_INTERVAL_SECONDS, overlap_start)
+            )
+    return result
+
+
+def rain_state(
+    payload: dict[str, object], now: datetime | None = None
+) -> dict[str, object]:
+    """Derive current and next-hour liquid-rain state from one API payload."""
+    current = payload.get("current") or {}
+    minutely = payload.get("minutely_15") or {}
+
+    times = list(minutely.get("time") or [])
+    rain = list(minutely.get("rain") or [])
+    showers = list(minutely.get("showers") or [])
+    codes = list(minutely.get("weather_code") or [])
+    probabilities = list(minutely.get("precipitation_probability") or [])
+    samples = forecast_samples(times, api_local_now(payload, now))
+    intervals: list[tuple[int, float, bool, datetime]] = []
+    for index, fraction, overlap_start in samples:
+        amount = (
+            max(
+                0.0,
+                numeric(rain[index] if index < len(rain) else 0)
+                + numeric(showers[index] if index < len(showers) else 0),
+            )
+            * fraction
+        )
+        code_is_rain = is_rain_code(codes[index] if index < len(codes) else 0)
+        intervals.append((index, amount, code_is_rain, overlap_start))
+
+    forecast_total = sum(amount for _, amount, _, _ in intervals)
+    forecast_rain = (
+        any(amount >= RAIN_INTERVAL_MM for _, amount, _, _ in intervals)
+        or any(
+            code_is_rain and amount >= RAIN_CODE_INTERVAL_MM
+            for _, amount, code_is_rain, _ in intervals
+        )
+        or forecast_total >= RAIN_HOUR_MM
+    )
+    next_rain = ""
+    if forecast_rain:
+        likely_start = next(
+            (
+                overlap_start
+                for _, amount, code_is_rain, overlap_start in intervals
+                if amount >= RAIN_INTERVAL_MM
+                or (code_is_rain and amount >= RAIN_CODE_INTERVAL_MM)
+            ),
+            next(
+                (
+                    overlap_start
+                    for _, amount, _, overlap_start in intervals
+                    if amount > 0
+                ),
+                None,
+            ),
+        )
+        if likely_start is not None:
+            next_rain = likely_start.strftime("%H:%M")
+
+    probability = round(
+        max(
+            (
+                numeric(probabilities[index])
+                for index, _, _ in samples
+                if index < len(probabilities)
+            ),
+            default=0.0,
+        )
+    )
+    probability = max(0, min(100, probability))
+
+    current_rain = max(
+        0.0, numeric(current.get("rain")) + numeric(current.get("showers"))
+    )
+    # rain/showers is the preceding 15-minute sum, not a rain sensor. Only the
+    # instant WMO condition may drive current-rain artwork.
+    rain_now = is_rain_code(current.get("weather_code"))
+    return {
+        "current_rain": current_rain,
+        "rain_now": rain_now,
+        "forecast_rain": forecast_rain,
+        "next_rain": next_rain,
+        "probability": probability,
+    }
+
+
+def cache_is_fresh() -> bool:
+    try:
+        text = CACHE.read_text(encoding="utf-8")
+        raw_lines = text.splitlines()
+        # Placeholder caches are state markers, not successful forecasts. A
+        # newly configured location or recovered network must retry at once.
+        if text == UNCONFIGURED_TEXT or (
+            raw_lines and "天氣資料暫時無法更新" in raw_lines[0]
+        ):
+            return False
+        lines = [line for line in raw_lines if line.strip()]
+        return (
+            len(lines) >= 3
+            and datetime.now().timestamp() - CACHE.stat().st_mtime < FRESH_SECONDS
+        )
+    except OSError:
+        return False
+
+
+def cache_age_seconds() -> float | None:
+    try:
+        return max(0.0, datetime.now().timestamp() - CACHE.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def fetch(latitude: float, longitude: float) -> dict[str, object]:
+    parameters = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": (
+            "temperature_2m,apparent_temperature,relative_humidity_2m,"
+            "rain,showers,weather_code,surface_pressure,wind_speed_10m,visibility,is_day"
+        ),
+        "minutely_15": "rain,showers,weather_code,precipitation_probability",
+        "forecast_minutely_15": 7,
+        "daily": "sunrise,sunset",
+        "timezone": "auto",
+        "wind_speed_unit": "ms",
+    }
+    url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(parameters)
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "P14s-UIOS-lock-weather/1"}
+    )
+    with urllib.request.urlopen(request, timeout=12) as response:
+        return json.load(response)
+
+
+def render(payload: dict[str, object], city: str, now: datetime | None = None) -> str:
+    current = payload.get("current") or {}
+    daily = payload.get("daily") or {}
+    rain = rain_state(payload, now)
+    rain_probability = int(rain["probability"])
+    next_rain = str(rain["next_rain"])
+
+    temp = round(float(current.get("temperature_2m") or 0))
+    feels = round(float(current.get("apparent_temperature") or 0))
+    humidity = round(float(current.get("relative_humidity_2m") or 0))
+    wind = float(current.get("wind_speed_10m") or 0)
+    precipitation = float(rain["current_rain"])
+    visibility = float(current.get("visibility") or 0) / 1000
+    pressure = round(float(current.get("surface_pressure") or 0))
+    weather_code = int(current.get("weather_code") or 0)
+    sunrise = short_time((daily.get("sunrise") or [""])[0])
+    sunset = short_time((daily.get("sunset") or [""])[0])
+    if bool(rain["rain_now"]):
+        rain_text = f"模型顯示目前有雨 · 短時降水 {rain_probability}%"
+    elif next_rain:
+        rain_text = f"{next_rain} 前後可能有雨 {rain_probability}%"
+    else:
+        rain_text = f"短時降水機率 {rain_probability}%"
+    updated = datetime.now().strftime("%H:%M • %Y/%m/%d")
+    if bool(rain["rain_now"]):
+        weather_mode = "rain"
+    elif weather_code == 0:
+        weather_mode = "sun" if int(current.get("is_day") or 0) == 1 else "moon"
+    else:
+        weather_mode = "cloud"
+    return (
+        "\n".join(
+            (
+                f"{city} · {temp}°C · {description(weather_code)} · {rain_text}",
+                f"體感 {feels}°C · 濕度 {humidity}% · 風速 {wind:.1f} m/s · 近 15 分鐘雨量 {precipitation:.1f} mm",
+                f"能見度 {visibility:.1f} km · 氣壓 {pressure} hPa · 日出 {sunrise} · 日落 {sunset} · 更新 {updated}",
+                weather_mode,
+            )
+        )
+        + "\n"
+    )
+
+
+def atomic_write(text: str) -> None:
+    CACHE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=".weather-lock.", dir=CACHE.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, CACHE)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args()
+    city = "目前位置"
+    try:
+        location = configured_location()
+        if location is None:
+            try:
+                if CACHE.read_text(encoding="utf-8") == UNCONFIGURED_TEXT:
+                    return 0
+            except OSError:
+                pass
+            atomic_write(UNCONFIGURED_TEXT)
+            return 0
+        if not args.force and cache_is_fresh():
+            return 0
+        latitude, longitude, city = location
+        atomic_write(render(fetch(latitude, longitude), city))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        print(f"update-lock-weather: {error}", file=os.sys.stderr)
+        if (age := cache_age_seconds()) is None or age > STALE_SECONDS:
+            try:
+                atomic_write(unavailable_text(city))
+            except OSError as cache_error:
+                print(f"update-lock-weather: {cache_error}", file=os.sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

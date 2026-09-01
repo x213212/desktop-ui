@@ -1,0 +1,11 @@
+[Unit]
+Description=Clear modifier keys stuck by an interrupted Deskflow session
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/unstick-keys --watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

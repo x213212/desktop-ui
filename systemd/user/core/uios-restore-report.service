@@ -1,0 +1,21 @@
+[Unit]
+Description=Collect one session-restore diagnostic report after login
+Documentation=https://wiki.hypr.land/IPC/
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+
+[Service]
+Type=oneshot
+# Wait for the restore to settle, then snapshot every signal that has had to be
+# collected by hand until now: marker verdict, terminal bindings, snapshot
+# contents, checkpoint refusals, display handoffs and the restore timeline.
+ExecStart=/usr/bin/python3 %h/.local/bin/uios-restore-report 45
+Nice=15
+CPUWeight=10
+IOSchedulingClass=idle
+TimeoutStartSec=180
+
+[Install]
+WantedBy=graphical-session.target

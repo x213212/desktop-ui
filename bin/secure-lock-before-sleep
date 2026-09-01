@@ -1,0 +1,243 @@
+#!/usr/bin/python3
+"""Own pre-sleep locking and repair workspace routing after resume."""
+
+import os
+from pathlib import Path
+import subprocess
+import time
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+
+LOGIN_DEST = "org.freedesktop.login1"
+LOGIN_PATH = "/org/freedesktop/login1"
+LOGIN_IFACE = "org.freedesktop.login1.Manager"
+LOCAL_BIN = Path.home() / ".local" / "bin"
+VERIFIED_LOCK_COMMAND = [str(LOCAL_BIN / "secure-screen-lock"), "--mark-session"]
+WORKSPACE_REPAIR_COMMAND = [
+    str(LOCAL_BIN / "hypr-session-state"),
+    "repair-workspaces",
+    "--quiet",
+]
+SESSION_CHECKPOINT_COMMAND = [
+    str(LOCAL_BIN / "hypr-session-state"),
+    "save",
+    "--force",
+    "--quiet",
+]
+WORKSPACE_REPAIR_RETRY_MS = (500, 1000, 2000)
+
+
+class SecureSleepLock:
+    def __init__(self):
+        self.inhibitor_fd = None
+        self.inhibitor_retry_source = None
+        self.shutdown_inhibitor_fd = None
+        self.shutdown_retry_source = None
+        self.workspace_repair_source = None
+        self.workspace_repair_process = None
+        self.workspace_repair_retry = 0
+        self.workspace_repair_enabled = False
+        self.system_bus = dbus.SystemBus()
+        login_object = self.system_bus.get_object(LOGIN_DEST, LOGIN_PATH)
+        self.login = dbus.Interface(login_object, LOGIN_IFACE)
+        self.system_bus.add_signal_receiver(
+            self.prepare_for_sleep,
+            signal_name="PrepareForSleep",
+            dbus_interface=LOGIN_IFACE,
+            bus_name=LOGIN_DEST,
+            path=LOGIN_PATH,
+        )
+        self.system_bus.add_signal_receiver(
+            self.prepare_for_shutdown,
+            signal_name="PrepareForShutdown",
+            dbus_interface=LOGIN_IFACE,
+            bus_name=LOGIN_DEST,
+            path=LOGIN_PATH,
+        )
+        self.acquire_inhibitor()
+        self.acquire_shutdown_inhibitor()
+
+    def acquire_inhibitor(self):
+        if self.inhibitor_fd is not None:
+            return
+        try:
+            unix_fd = self.login.Inhibit(
+                "sleep",
+                "uíOS hyprlock coordinator",
+                "Lock the screen before suspending",
+                "delay",
+            )
+            self.inhibitor_fd = unix_fd.take()
+        except Exception as error:
+            print(f"Could not acquire sleep inhibitor: {error}", flush=True)
+            if self.inhibitor_retry_source is None:
+                self.inhibitor_retry_source = GLib.timeout_add_seconds(
+                    2, self.retry_inhibitor
+                )
+
+    def retry_inhibitor(self):
+        self.inhibitor_retry_source = None
+        self.acquire_inhibitor()
+        return False
+
+    def release_inhibitor(self):
+        if self.inhibitor_fd is None:
+            return
+        os.close(self.inhibitor_fd)
+        self.inhibitor_fd = None
+
+    def acquire_shutdown_inhibitor(self):
+        if self.shutdown_inhibitor_fd is not None:
+            return
+        try:
+            unix_fd = self.login.Inhibit(
+                "shutdown",
+                "uíOS session checkpoint",
+                "Save the visible desktop before shutdown",
+                "delay",
+            )
+            self.shutdown_inhibitor_fd = unix_fd.take()
+        except Exception as error:
+            print(f"Could not acquire shutdown inhibitor: {error}", flush=True)
+            if self.shutdown_retry_source is None:
+                self.shutdown_retry_source = GLib.timeout_add_seconds(
+                    2, self.retry_shutdown_inhibitor
+                )
+
+    def retry_shutdown_inhibitor(self):
+        self.shutdown_retry_source = None
+        self.acquire_shutdown_inhibitor()
+        return False
+
+    def release_shutdown_inhibitor(self):
+        if self.shutdown_inhibitor_fd is None:
+            return
+        os.close(self.shutdown_inhibitor_fd)
+        self.shutdown_inhibitor_fd = None
+
+    def checkpoint_session(self):
+        # Announce success as well as failure. This is the last chance to record
+        # the desktop before shutdown, and a silent success is indistinguishable
+        # from never having run -- which is exactly the question that could not
+        # be answered when the restored session turned out to be stale.
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                SESSION_CHECKPOINT_COMMAND,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10.0,
+            )
+            elapsed = time.monotonic() - started
+            if result.returncode != 0:
+                print(f"Shutdown checkpoint failed ({result.returncode})", flush=True)
+            else:
+                print(f"Shutdown checkpoint saved in {elapsed:.2f}s", flush=True)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print(f"Shutdown checkpoint failed: {error}", flush=True)
+
+    def prepare_for_shutdown(self, shutting_down):
+        if bool(shutting_down):
+            try:
+                self.checkpoint_session()
+            finally:
+                self.release_shutdown_inhibitor()
+        else:
+            self.acquire_shutdown_inhibitor()
+
+    def lock_screen(self):
+        # This service is the only PrepareForSleep command owner. The helper
+        # waits for the compositor-secure hyprlock surface before we release
+        # the delay inhibitor; there is deliberately no second lock UI.
+        try:
+            result = subprocess.run(
+                VERIFIED_LOCK_COMMAND,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                # Do not release the sleep inhibitor in the middle of the
+                # bounded, verified hyprlock startup path.
+                timeout=10.0,
+            )
+            if result.returncode != 0:
+                print(f"Verified lock failed ({result.returncode})", flush=True)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print(f"Verified lock failed: {error}", flush=True)
+
+    def repair_workspaces(self):
+        self.workspace_repair_source = None
+        if self.workspace_repair_process is not None:
+            if self.workspace_repair_process.poll() is None:
+                return False
+            self.workspace_repair_process = None
+        try:
+            # Keep the DBus/GLib sleep listener responsive. The repair helper
+            # verifies its own dispatches and reports failures to the journal.
+            self.workspace_repair_process = subprocess.Popen(
+                WORKSPACE_REPAIR_COMMAND,
+                stdout=subprocess.DEVNULL,
+            )
+            GLib.child_watch_add(
+                self.workspace_repair_process.pid,
+                self.workspace_repair_finished,
+            )
+        except OSError as error:
+            print(f"Workspace resume repair failed: {error}", flush=True)
+            self.schedule_workspace_repair_retry()
+        return False
+
+    def workspace_repair_finished(self, _pid, status):
+        self.workspace_repair_process = None
+        exit_code = os.waitstatus_to_exitcode(status)
+        if exit_code == 0 or not self.workspace_repair_enabled:
+            return
+        self.schedule_workspace_repair_retry()
+
+    def schedule_workspace_repair_retry(self):
+        if not self.workspace_repair_enabled:
+            return
+        if self.workspace_repair_retry >= len(WORKSPACE_REPAIR_RETRY_MS):
+            print("Workspace resume repair exhausted bounded retries", flush=True)
+            return
+        delay = WORKSPACE_REPAIR_RETRY_MS[self.workspace_repair_retry]
+        self.workspace_repair_retry += 1
+        if self.workspace_repair_source is not None:
+            GLib.source_remove(self.workspace_repair_source)
+        self.workspace_repair_source = GLib.timeout_add(delay, self.repair_workspaces)
+
+    def prepare_for_sleep(self, sleeping):
+        if bool(sleeping):
+            self.workspace_repair_enabled = False
+            if self.workspace_repair_source is not None:
+                GLib.source_remove(self.workspace_repair_source)
+                self.workspace_repair_source = None
+            try:
+                self.lock_screen()
+            finally:
+                self.release_inhibitor()
+        else:
+            self.acquire_inhibitor()
+            self.workspace_repair_enabled = True
+            self.workspace_repair_retry = 0
+            # Reinitialize only workspace routing after Wayland is awake. This
+            # moves windows out of generated numeric garbage and restores the
+            # last normal focus without restarting Hyprland or applications.
+            if self.workspace_repair_source is not None:
+                GLib.source_remove(self.workspace_repair_source)
+            self.workspace_repair_source = GLib.timeout_add_seconds(
+                1, self.repair_workspaces
+            )
+
+
+def main():
+    DBusGMainLoop(set_as_default=True)
+    SecureSleepLock()
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

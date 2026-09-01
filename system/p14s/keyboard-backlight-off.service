@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep ThinkPad keyboard backlight off at boot
+ConditionPathExists=/sys/class/leds/tpacpi::kbd_backlight/brightness
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'printf 0 > /sys/class/leds/tpacpi::kbd_backlight/brightness'
+
+[Install]
+WantedBy=multi-user.target

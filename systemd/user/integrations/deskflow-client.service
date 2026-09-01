@@ -1,0 +1,25 @@
+[Unit]
+Description=Deskflow client (background, no GUI)
+# Stop retrying after five failures in fifteen minutes. The interval is longer
+# than the full stepped-backoff sequence, so old failures cannot slide out of
+# the window and turn into a permanent two-minute retry loop. A successful run resets
+# the counter automatically, while a persistent configuration/network failure
+# no longer creates an endless restart loop.
+StartLimitIntervalSec=15min
+StartLimitBurst=5
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/flatpak run --command=deskflow-core org.deskflow.deskflow --new-instance client
+# A clean exit is intentional and must not be restarted. For crashes, start
+# with a short delay and progressively back off before the unit hits its limit.
+Restart=on-failure
+RestartSec=15s
+RestartSteps=4
+RestartMaxDelaySec=2min
+TimeoutStopSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

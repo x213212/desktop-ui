@@ -1,0 +1,13 @@
+# command or alternatives separated by |<TAB>feature that is unavailable when missing
+flatpak	EasyEffects, Deskflow and Remmina integrations
+waynergy	Waynergy client; external build and private config required
+swappy	screenshot annotation
+ffmpeg	media conversion and some thumbnail helpers
+mpvpaper	video wallpapers
+songrec	music recognition
+swww	alternative wallpaper backend
+playerctl	extra MPRIS command-line controls
+pactl	PulseAudio compatibility diagnostics
+socat	IPC diagnostics
+sassc	GTK/Kvantum theme generation
+goa-daemon|gnome-online-accounts-gtk	Google account integration; credentials remain external

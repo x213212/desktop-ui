@@ -1,0 +1,302 @@
+#!/usr/bin/python3
+"""Debounce P14s lid events without polling while the lid is idle.
+
+The firmware lid switch on this machine is not SW_LID compliant, so UPower
+both bounces the state and replays it at resume.  Suspend is therefore armed
+only by a lid transition observed while the system is demonstrably awake:
+logind's PrepareForSleep is the authority on that, never a timer.
+"""
+
+from __future__ import annotations
+
+import glob
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+
+UPOWER_DEST = "org.freedesktop.UPower"
+UPOWER_PATH = "/org/freedesktop/UPower"
+UPOWER_IFACE = "org.freedesktop.UPower"
+LOGIND_DEST = "org.freedesktop.login1"
+LOGIND_PATH = "/org/freedesktop/login1"
+LOGIND_IFACE = "org.freedesktop.login1.Manager"
+PROPERTIES_IFACE = "org.freedesktop.DBus.Properties"
+# The panel switch bounces; a quarter second is inside the bounce window.
+CLOSE_DEBOUNCE_MS = 800
+OPEN_REARM_MS = 500
+# Nothing the lid reports within this window after resume is a user action.
+# UPower replays the pre-suspend state here, which used to re-suspend the
+# machine about one second after it woke up.
+POST_RESUME_GRACE_SECONDS = 6.0
+SESSION_ACTION = Path.home() / ".local/bin/uios-session-action"
+
+
+def find_lid_state_file() -> str | None:
+    paths = sorted(glob.glob("/proc/acpi/button/lid/*/state"))
+    return paths[0] if paths else None
+
+
+def read_acpi_lid_state() -> bool | None:
+    path = find_lid_state_file()
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="ascii") as state_file:
+            state = state_file.read().partition(":")[2].strip().lower()
+    except OSError:
+        return None
+    if state == "closed":
+        return True
+    if state == "open":
+        return False
+    return None
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+class LidSuspendController:
+    def __init__(self) -> None:
+        self.loop = GLib.MainLoop()
+        self.close_source: int | None = None
+        self.open_source: int | None = None
+        self.armed = False
+        self.sleeping = False
+        self.awake_not_before = 0.0
+
+        self.bus = dbus.SystemBus()
+        upower_object = self.bus.get_object(UPOWER_DEST, UPOWER_PATH)
+        self.properties = dbus.Interface(upower_object, PROPERTIES_IFACE)
+        self.bus.add_signal_receiver(
+            self.properties_changed,
+            signal_name="PropertiesChanged",
+            dbus_interface=PROPERTIES_IFACE,
+            bus_name=UPOWER_DEST,
+            path=UPOWER_PATH,
+        )
+        self.bus.add_signal_receiver(
+            self.name_owner_changed,
+            signal_name="NameOwnerChanged",
+            dbus_interface="org.freedesktop.DBus",
+            bus_name="org.freedesktop.DBus",
+            path="/org/freedesktop/DBus",
+            arg0=UPOWER_DEST,
+        )
+        # The only reliable "the system just woke" signal.  Without it a
+        # replayed lid-closed event at resume looks like a fresh lid close.
+        self.bus.add_signal_receiver(
+            self.prepare_for_sleep,
+            signal_name="PrepareForSleep",
+            dbus_interface=LOGIND_IFACE,
+            bus_name=LOGIND_DEST,
+            path=LOGIND_PATH,
+        )
+
+        initial = self.read_lid_closed()
+        if initial is None:
+            raise RuntimeError("neither UPower nor ACPI exposed a lid state")
+        log("monitoring UPower LidIsClosed and logind PrepareForSleep")
+        self.handle_lid_state(initial)
+
+    def read_lid_closed(self) -> bool | None:
+        try:
+            return bool(self.properties.Get(UPOWER_IFACE, "LidIsClosed"))
+        except dbus.DBusException:
+            return read_acpi_lid_state()
+
+    @staticmethod
+    def remove_source(source: int | None) -> None:
+        if source is not None:
+            GLib.source_remove(source)
+
+    def cancel_pending(self) -> None:
+        self.remove_source(self.close_source)
+        self.close_source = None
+        self.remove_source(self.open_source)
+        self.open_source = None
+
+    def in_resume_grace(self) -> bool:
+        return time.monotonic() < self.awake_not_before
+
+    def prepare_for_sleep(self, going_to_sleep: bool) -> None:
+        if bool(going_to_sleep):
+            # Disarm before the freeze so no timer survives into resume.
+            self.sleeping = True
+            self.cancel_pending()
+            self.armed = False
+            log("entering sleep; lid suspend disarmed")
+            return
+
+        self.sleeping = False
+        self.cancel_pending()
+        # Stay disarmed until a lid open is confirmed after the grace window.
+        # A machine that woke with the lid shut must never re-suspend itself.
+        self.armed = False
+        self.awake_not_before = time.monotonic() + POST_RESUME_GRACE_SECONDS
+        log(
+            "resumed; ignoring lid events for "
+            f"{POST_RESUME_GRACE_SECONDS:g}s before re-arming"
+        )
+        self.open_source = GLib.timeout_add(
+            int(POST_RESUME_GRACE_SECONDS * 1000),
+            self.confirm_open,
+        )
+
+    def properties_changed(
+        self,
+        interface: str,
+        changed: dict,
+        _invalidated: list,
+    ) -> None:
+        if interface != UPOWER_IFACE:
+            return
+        if "LidIsClosed" in changed:
+            self.handle_lid_state(bool(changed["LidIsClosed"]))
+        elif "LidIsClosed" in _invalidated:
+            current = self.read_lid_closed()
+            if current is not None:
+                self.handle_lid_state(current)
+
+    def name_owner_changed(
+        self,
+        _name: str,
+        _old_owner: str,
+        new_owner: str,
+    ) -> None:
+        if new_owner:
+            GLib.timeout_add(250, self.refresh_after_upower_restart)
+
+    def refresh_after_upower_restart(self) -> bool:
+        current = self.read_lid_closed()
+        if current is not None:
+            self.handle_lid_state(current)
+        return False
+
+    def handle_lid_state(self, closed: bool) -> None:
+        if self.sleeping:
+            log(f"lid event: {'closed' if closed else 'open'} (asleep; ignored)")
+            return
+
+        in_grace = self.in_resume_grace()
+        log(
+            f"lid event: {'closed' if closed else 'open'}"
+            f"{' (resume grace)' if in_grace else ''}"
+        )
+
+        if closed:
+            self.remove_source(self.open_source)
+            self.open_source = None
+            self.remove_source(self.close_source)
+            self.close_source = None
+            if self.armed and not in_grace:
+                self.close_source = GLib.timeout_add(
+                    CLOSE_DEBOUNCE_MS,
+                    self.confirm_closed,
+                )
+            return
+
+        self.remove_source(self.close_source)
+        self.close_source = None
+        self.remove_source(self.open_source)
+        delay_ms = max(
+            OPEN_REARM_MS,
+            int(max(0.0, self.awake_not_before - time.monotonic()) * 1000),
+        )
+        self.open_source = GLib.timeout_add(delay_ms, self.confirm_open)
+
+    def confirm_open(self) -> bool:
+        self.open_source = None
+        if self.sleeping:
+            return False
+        if self.read_lid_closed() is False:
+            remaining = self.awake_not_before - time.monotonic()
+            if remaining > 0:
+                self.open_source = GLib.timeout_add(
+                    max(1, int(remaining * 1000)),
+                    self.confirm_open,
+                )
+                return False
+            if not self.armed:
+                self.armed = True
+                log("stable lid open; suspend re-armed")
+        return False
+
+    def confirm_closed(self) -> bool:
+        self.close_source = None
+        if self.sleeping or self.in_resume_grace():
+            log("ignored a lid close raised around a sleep transition")
+            return False
+        if not self.armed or self.read_lid_closed() is not True:
+            log("ignored a bounced closed signal")
+            return False
+
+        self.armed = False
+        log("stable lid close; checkpointing and requesting suspend")
+        # systemctl suspend returns as soon as logind accepts the job, long
+        # before the machine sleeps, so nothing is inferred from its return.
+        # PrepareForSleep drives the state machine from here.
+        # --if-lid-still-closed lets the helper abandon the suspend if the lid
+        # was reopened while it locked and checkpointed. Without it the machine
+        # slept anyway and the user sat through a needless resume.
+        result = subprocess.run(
+            [str(SESSION_ACTION), "--if-lid-still-closed", "suspend"],
+            check=False,
+        )
+        if result.returncode != 0:
+            log(f"suspend request rejected (rc={result.returncode}); re-arming")
+            self.handle_lid_state(bool(self.read_lid_closed()))
+        return False
+
+    def stop(self, _signum: int, _frame: object) -> None:
+        self.loop.quit()
+
+    def run(self) -> int:
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
+        self.loop.run()
+        return 0
+
+
+def current_state() -> bool | None:
+    DBusGMainLoop(set_as_default=True)
+    try:
+        bus = dbus.SystemBus()
+        properties = dbus.Interface(
+            bus.get_object(UPOWER_DEST, UPOWER_PATH),
+            PROPERTIES_IFACE,
+        )
+        return bool(properties.Get(UPOWER_IFACE, "LidIsClosed"))
+    except dbus.DBusException:
+        return read_acpi_lid_state()
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--check"]:
+        state = current_state()
+        if state is None:
+            print("lid: unknown")
+            return 1
+        print(f"lid: {'closed' if state else 'open'}")
+        return 0
+    if sys.argv[1:]:
+        print("usage: p14s-lid-debounce [--check]", file=sys.stderr)
+        return 2
+
+    DBusGMainLoop(set_as_default=True)
+    try:
+        return LidSuspendController().run()
+    except (RuntimeError, dbus.DBusException) as error:
+        log(f"lid monitor failed: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

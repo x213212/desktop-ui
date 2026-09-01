@@ -1,0 +1,14 @@
+[Unit]
+Description=Fcitx 5 input method daemon
+Documentation=https://fcitx-im.org/wiki/Setup_Fcitx_5
+After=dbus.service graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=30s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/fcitx5 -D -r
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s

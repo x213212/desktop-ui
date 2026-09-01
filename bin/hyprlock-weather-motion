@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# One tiny animated weather label for the independent Hyprlock owner.
+# Hyprlock starts this only while locked; bash built-ins keep each frame cheap.
+set -u
+
+weather_cache="${XDG_CACHE_HOME:-${HOME}/.cache}/hyprlock/weather.txt"
+weather_mode="cloud"
+
+if [[ -r "${weather_cache}" ]]; then
+    mapfile -t weather_lines < "${weather_cache}"
+    if (( ${#weather_lines[@]} >= 4 )); then
+        weather_mode="${weather_lines[3]}"
+    fi
+fi
+
+fraction="${EPOCHREALTIME#*.}"
+frame=$((10#${fraction:0:6} / 250000))
+
+case "${weather_mode}" in
+    rain)
+        frames=(rainy_light rainy rainy_heavy rainy)
+        ;;
+    sun)
+        frames=(sunny clear_day light_mode clear_day)
+        ;;
+    moon)
+        frames=(clear_night nightlight dark_mode nightlight)
+        ;;
+    *)
+        frames=(cloud filter_drama cloud_queue filter_drama)
+        ;;
+esac
+
+printf '%s' "${frames[frame]}"

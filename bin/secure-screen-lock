@@ -1,0 +1,313 @@
+#!/usr/bin/python3
+"""Acquire and verify the graphical session lock with an isolated lock owner."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+
+HYPRLOCK = "/usr/bin/hyprlock"
+HYPRCTL = "/usr/bin/hyprctl"
+PGREP = "/usr/bin/pgrep"
+LOGGER = "/usr/bin/logger"
+LOGINCTL = "/usr/bin/loginctl"
+POLL_SECONDS = 0.08
+START_DEADLINE_SECONDS = 3.0
+STALE_START_GRACE_SECONDS = 0.6
+STALE_EXIT_GRACE_SECONDS = 0.8
+
+
+def runtime_dir() -> Path:
+    return Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+
+
+def live_session_env() -> dict[str, str]:
+    """Return an environment that names the compositor which is running now.
+
+    hyprlock aborts outright ("Couldn't connect to a wayland compositor") when
+    WAYLAND_DISPLAY points at a socket a previous Hyprland owned, and hyprctl
+    fails the same way on a stale instance signature. Long-lived units keep the
+    values they were started with, so a compositor restart used to turn every
+    later lock request into a SIGABRT with its reason discarded. Trust the live
+    runtime directory instead of whatever was inherited.
+    """
+    env = dict(os.environ)
+    runtime = runtime_dir()
+
+    display = env.get("WAYLAND_DISPLAY", "")
+    display_path = Path(display) if display.startswith("/") else runtime / display
+    if not (display and display_path.is_socket()):
+        sockets = [
+            item
+            for item in runtime.glob("wayland-*")
+            if item.is_socket() and not item.name.endswith(".lock")
+        ]
+        if sockets:
+            newest = max(sockets, key=lambda item: item.stat().st_mtime)
+            log(f"WAYLAND_DISPLAY was stale ({display!r}); using {newest.name}")
+            env["WAYLAND_DISPLAY"] = newest.name
+
+    signature = env.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    instances = runtime / "hypr"
+    if not (signature and (instances / signature).is_dir()):
+        candidates = [item for item in instances.glob("*") if item.is_dir()] if instances.is_dir() else []
+        if candidates:
+            newest = max(candidates, key=lambda item: item.stat().st_mtime)
+            log(f"HYPRLAND_INSTANCE_SIGNATURE was stale ({signature!r}); using {newest.name}")
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = newest.name
+
+    return env
+
+
+_SESSION_ENV: dict[str, str] | None = None
+
+
+def session_env() -> dict[str, str]:
+    global _SESSION_ENV
+    if _SESSION_ENV is None:
+        _SESSION_ENV = live_session_env()
+    return _SESSION_ENV
+
+
+def mark_session_locked() -> None:
+    """Update logind's LockedHint only after the graphical lock is secure."""
+    try:
+        result = subprocess.run(
+            [LOGINCTL, "lock-session"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.75,
+        )
+        if result.returncode != 0:
+            log(f"loginctl lock-session failed with status {result.returncode}")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log(f"loginctl lock-session failed: {error}")
+
+
+def log(message: str) -> None:
+    try:
+        subprocess.run(
+            [LOGGER, "-t", "secure-screen-lock", message],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.4,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def hyprlock_pids() -> list[int]:
+    try:
+        result = subprocess.run(
+            [PGREP, "-u", str(os.getuid()), "-x", "hyprlock"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=0.25,
+        )
+        if result.returncode != 0:
+            return []
+        return [
+            int(line)
+            for line in result.stdout.splitlines()
+            if line.strip().isdigit()
+        ]
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+
+def compositor_lock_state() -> bool | None:
+    """Return True/False only for an authoritative compositor response."""
+    try:
+        result = subprocess.run(
+            [HYPRCTL, "-j", "locked"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=0.35,
+            env=session_env(),
+        )
+        if result.returncode != 0:
+            return None
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict) or not isinstance(payload.get("locked"), bool):
+            return None
+        return payload["locked"]
+    except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
+        return None
+
+
+def compositor_locked() -> bool:
+    return compositor_lock_state() is True
+
+
+def verified_lock() -> bool:
+    """Accept exactly one compositor lock; never add a second lock owner."""
+    return compositor_locked()
+
+
+def wait_for_verified_lock(timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if verified_lock():
+            return True
+        time.sleep(POLL_SECONDS)
+    return verified_lock()
+
+
+def stop_stale_hyprlock(pids: list[int]) -> bool:
+    """Retire unlocked leftovers before creating the sole next lock owner."""
+    state = compositor_lock_state()
+    if state is not False:
+        log("refusing to stop a lock owner while compositor state is not confirmed unlocked")
+        return state is True
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except OSError as error:
+            log(f"cannot stop stale hyprlock {pid}: {error}")
+            return False
+
+    deadline = time.monotonic() + STALE_EXIT_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        state = compositor_lock_state()
+        if state is True:
+            return True
+        if state is None:
+            log("lock state became unavailable while retiring a stale owner")
+            return False
+        if not hyprlock_pids():
+            return True
+        time.sleep(POLL_SECONDS)
+
+    remaining = hyprlock_pids()
+    if remaining:
+        log(f"stale hyprlock did not exit: {','.join(map(str, remaining))}")
+        return False
+    return True
+
+
+def start_hyprlock() -> bool:
+    # Another secure owner may already hold ext-session-lock. Treat that as
+    # complete instead of racing it and producing two stacked lock screens.
+    state = compositor_lock_state()
+    if state is True:
+        return True
+    if state is None:
+        log("cannot query compositor lock state; refusing an unsafe replacement")
+        return False
+
+    existing = hyprlock_pids()
+    if existing:
+        # A just-spawned owner gets a short grace period. If it never acquired
+        # the compositor lock it is stale and must leave before a replacement.
+        if wait_for_verified_lock(STALE_START_GRACE_SECONDS):
+            return True
+        state = compositor_lock_state()
+        if state is None:
+            log("existing lock owner retained because compositor state is unknown")
+            return False
+        if not stop_stale_hyprlock(existing):
+            return False
+        state = compositor_lock_state()
+        if state is True:
+            return True
+        if state is None:
+            return False
+
+    # hyprlock aborts with the reason on stderr. Discarding it made every
+    # "hyprlock exited before securing the compositor" report undiagnosable,
+    # so the output is routed into the journal under its own tag instead.
+    sink = None
+    try:
+        sink = subprocess.Popen(
+            [LOGGER, "-t", "hyprlock"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        log(f"cannot start the hyprlock log sink: {error}")
+
+    output = sink.stdin if sink is not None else subprocess.DEVNULL
+    try:
+        process = subprocess.Popen(
+            [HYPRLOCK, "--immediate-render"],
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=output,
+            start_new_session=True,
+            env=session_env(),
+        )
+    except OSError as error:
+        log(f"failed to start hyprlock: {error}")
+        return False
+    finally:
+        # Only hyprlock keeps the sink open; this process must not hold it.
+        if sink is not None:
+            sink.stdin.close()
+
+    deadline = time.monotonic() + START_DEADLINE_SECONDS
+    while time.monotonic() < deadline:
+        if compositor_locked():
+            return True
+        if process.poll() is not None:
+            log(f"hyprlock exited before securing the compositor ({process.returncode})")
+            return False
+        time.sleep(POLL_SECONDS)
+
+    log("hyprlock stayed alive but did not secure the compositor")
+    if process.poll() is None:
+        stop_stale_hyprlock([process.pid])
+    return False
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args not in ([], ["--mark-session"]):
+        log("usage: secure-screen-lock [--mark-session]")
+        return 2
+
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    lock_path = runtime_dir / "secure-screen-lock.lock"
+
+    try:
+        lock_file = lock_path.open("w", encoding="utf-8")
+    except OSError as error:
+        log(f"cannot open serialization lock: {error}")
+        return 1
+
+    with lock_file:
+        # Idle timeout, loginctl and pre-suspend hooks may arrive together.
+        # Serialize them so only one lock protocol request is made.
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+        already_locked = compositor_locked()
+        if not start_hyprlock():
+            # Fail closed and report the real error. Launching a different UI
+            # here caused the duplicate lock screen this coordinator prevents.
+            log("hyprlock failed; no alternate lock UI was started")
+            return 1
+
+        # Mark logind only after a real Wayland lock exists. The resulting
+        # hypridle DBus callback re-enters this helper, waits on the same flock,
+        # observes the existing lock and exits without creating another owner.
+        if args == ["--mark-session"] and not already_locked:
+            mark_session_locked()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

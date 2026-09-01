@@ -1,0 +1,5 @@
+# Fontconfig family names. Material Symbols Rounded is bundled with end4-pC.
+Google Sans Flex
+JetBrainsMono Nerd Font
+Readex Pro
+Space Grotesk

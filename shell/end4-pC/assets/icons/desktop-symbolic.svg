@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- Copyright (C) 2026 desktop-ui contributors -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <path d="M4 3.5h16A2.5 2.5 0 0 1 22.5 6v10A2.5 2.5 0 0 1 20 18.5h-6.75v1.75H17a1 1 0 1 1 0 2H7a1 1 0 1 1 0-2h3.75V18.5H4A2.5 2.5 0 0 1 1.5 16V6A2.5 2.5 0 0 1 4 3.5Zm0 2a.5.5 0 0 0-.5.5v9.25h17V6a.5.5 0 0 0-.5-.5H4Z"/>
+</svg>

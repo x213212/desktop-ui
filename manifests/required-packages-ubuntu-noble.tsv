@@ -1,0 +1,40 @@
+# package<TAB>purpose. Informational only: no script invokes apt or adds a PPA.
+hyprland	compositor; reference package comes from cppiber/hyprland PPA
+hypridle	idle daemon
+hyprlock	lock screen
+hyprsunset	night-light daemon
+xdg-desktop-portal-hyprland	Wayland portal backend
+wl-clipboard	wl-copy and wl-paste
+cliphist	clipboard history
+grim	screenshots
+slurp	region selection
+wf-recorder	screen recording
+jq	JSON processor
+ripgrep	repository portability and credential audit
+bc	calculator
+imagemagick	identify and convert
+brightnessctl	backlight control
+wireplumber	wpctl and audio session manager
+network-manager	nmcli
+bluez	bluetoothctl
+libnotify-bin	notify-send
+fuzzel	launcher
+ydotool	input automation
+hyprpicker	color picker
+gnome-keyring	secret service
+network-manager-gnome	nm-applet
+fcitx5	input method
+fcitx5-chewing	Traditional Chinese Chewing input method addon
+gnome-terminal	terminal
+nemo	file manager
+fish	interactive shell
+cava	audio visualizer
+python3	Python runtime
+python3-venv	isolated helper environment
+python3-gi	GObject introspection bindings
+gir1.2-gnomedesktop-4.0	GnomeDesktop thumbnail API typelib
+cmake	Quickshell build
+ninja-build	Quickshell build
+git	pinned source retrieval
+build-essential	C/C++ build toolchain
+pkg-config	hyprbars dependency discovery

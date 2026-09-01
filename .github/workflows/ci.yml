@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syntax-and-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          # fuzzel-emoji.sh intentionally appends non-shell emoji data after
+          # its executable section, so whole-file parsing is not meaningful.
+          mapfile -d '' shell_files < <(
+            git ls-files -z -- '*.sh' \
+              ':!config/hypr/hyprland/scripts/fuzzel-emoji.sh'
+          )
+          for file in "${shell_files[@]}"; do
+            bash -n "$file"
+          done
+
+          while IFS= read -r -d '' file; do
+            if head -n 1 "$file" | grep -Eq '^#!.*(bash|/sh)([[:space:]]|$)'; then
+              bash -n "$file"
+            fi
+          done < <(git ls-files -z -- 'bin/*')
+
+      - name: Check Python syntax
+        run: python -m compileall -q bin scripts shell tests
+
+      - name: Run regression tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -v

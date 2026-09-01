@@ -1,0 +1,45 @@
+[Unit]
+Description=Waynergy client for the Deskflow server
+Documentation=https://github.com/r-c-f/waynergy
+After=graphical-session.target network-online.target
+Wants=network-online.target
+PartOf=graphical-session.target
+Conflicts=deskflow-client.service
+StartLimitIntervalSec=15min
+StartLimitBurst=6
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/libexec/waynergy:/usr/local/bin:/usr/bin:/bin
+Environment=WAYNERGY_CONF_PATH=%h/.config/waynergy
+Environment=WAYNERGY_DISABLE_UINPUT=1
+ExecStart=%h/.local/libexec/waynergy/waynergy --fatal-ebsy
+Restart=on-failure
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=2min
+TimeoutStopSec=5s
+KillMode=control-group
+UMask=0077
+
+# This process receives network input, so keep it unprivileged and constrain
+# the parts of the system it can modify without blocking Wayland/clipboard.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+[Install]
+WantedBy=graphical-session.target

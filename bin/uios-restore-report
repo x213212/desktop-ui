@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Collect everything needed to diagnose one session restore, automatically.
+
+Every question asked so far -- did the terminals bind, did the snapshot freeze,
+which placement invariant failed, how long did the restore stall, did the panel
+blank -- has been answered by hand-running journalctl after the fact. The
+evidence is all available at login; nobody should have to fetch it.
+
+Runs once per graphical session, a short while after the restore settles, and
+appends one report to ~/.local/state/hypr-session/restore-reports.log.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "hypr-session"
+REPORT = STATE_DIR / "restore-reports.log"
+MARKER = STATE_DIR / "restored.json"
+SNAPSHOT = STATE_DIR / "session.json"
+SLOT_DIR = STATE_DIR / "session.d"
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+BINDINGS = RUNTIME / "hypr-session" / "terminal-bindings.json"
+MAX_REPORT_BYTES = 512 * 1024
+
+
+def run(command: list[str], timeout: float = 10.0) -> str:
+    try:
+        result = subprocess.run(
+            command, check=False, capture_output=True, text=True, timeout=timeout
+        )
+        return result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def journal(*args: str, timeout: float = 20.0) -> list[str]:
+    out = run(["journalctl", "-b", "0", "--no-pager", *args], timeout=timeout)
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def load(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def terminal_rows(snapshot: dict) -> list[str]:
+    rows = []
+    for window in snapshot.get("windows", []):
+        launch = window.get("launch") or {}
+        if launch.get("kind") != "terminal":
+            continue
+        rows.append(
+            f"program={launch.get('program', '?')} "
+            f"session_id={launch.get('session_id')} "
+            f"cwd={launch.get('cwd')}"
+        )
+    return rows
+
+
+def display_handoffs() -> list[str]:
+    wanted = re.compile(
+        r"simpledrm|vgaarb: deactivate|amdgpudrmfb|DMCUB error|Display Core", re.I
+    )
+    return [
+        re.sub(r"^.*kernel: ", "", line)
+        for line in journal("-k")
+        if wanted.search(line)
+    ]
+
+
+def restore_timing() -> list[str]:
+    """Spot the stalls: gaps between the windows the restore brings up."""
+    marks = re.compile(r"VTE child process|Started lightdm|New session c\d|"
+                       r"quickshell-ui\.service|hypr-session-autosave\.service")
+    lines = [line for line in journal() if marks.search(line)]
+    out, previous = [], None
+    for line in lines[:40]:
+        stamp = line.split()[2] if len(line.split()) > 2 else ""
+        gap = ""
+        if previous:
+            try:
+                a = [int(v) for v in previous.split(":")]
+                b = [int(v) for v in stamp.split(":")]
+                delta = (b[0] - a[0]) * 3600 + (b[1] - a[1]) * 60 + b[2] - a[2]
+                if delta >= 2:
+                    gap = f"   <-- {delta}s 空檔"
+            except (ValueError, IndexError):
+                pass
+        previous = stamp
+        out.append(re.sub(r"^\S+ \S+ \S+ \S+: ", f"{stamp}  ", line) + gap)
+    return out
+
+
+def main() -> int:
+    settle = float(sys.argv[1]) if len(sys.argv) > 1 else 45.0
+    time.sleep(settle)
+
+    marker = load(MARKER)
+    snapshot = load(SNAPSHOT)
+    bindings = load(BINDINGS)
+
+    lines: list[str] = []
+    add = lines.append
+    add("=" * 72)
+    add(f"restore report  {time.strftime('%Y-%m-%d %H:%M:%S%z')}")
+    add(f"kernel={os.uname().release}  booted={run(['uptime', '-s']).strip()}")
+    add("")
+
+    add("[還原結果]")
+    for key in (
+        "restored_at", "complete", "protect_snapshot", "unresolved",
+        "placement_verified", "placement_ordering_only",
+        "placement_verification_error", "missing_live_monitors", "topology",
+        "foreground_windows", "deferred_windows",
+    ):
+        if key in marker:
+            add(f"  {key:<30} {marker[key]}")
+    if not marker:
+        add("  (沒有 marker)")
+    add("")
+
+    add("[快照裡的終端機]")
+    rows = terminal_rows(snapshot)
+    add(f"  captured_at={snapshot.get('captured_at')} reason={snapshot.get('save_reason')}")
+    for row in rows or ["  (無)"]:
+        add(f"  {row}")
+    slots = sorted(p.name for p in SLOT_DIR.glob("*.json")) if SLOT_DIR.is_dir() else []
+    add(f"  topology 槽位: {', '.join(slots) or '(無)'}")
+    add("")
+
+    add("[終端機綁定]")
+    add(f"  bindings={len(bindings.get('bindings', []))} "
+        f"pending={len(bindings.get('pending', []))}")
+    for item in bindings.get("bindings", []):
+        add(f"    saved_window_id={item.get('saved_window_id')!r} "
+            f"shell_pid={item.get('shell_pid')} stable_id={item.get('stable_id')}")
+    add("")
+
+    add("[本次開機的 hypr-session-state 訊息]")
+    for line in journal("-t", "hypr-session-state")[-25:] or ["  (無)"]:
+        add(f"  {re.sub(r'^.*]: ', '', line)}")
+    add("")
+
+    add("[存檔被拒 / 恢復]")
+    hits = [line for line in journal() if "checkpoint refused" in line or "checkpoint resumed" in line]
+    for line in hits[-10:] or ["  (無 — 存檔一直正常)"]:
+        add(f"  {re.sub(r'^.*]: ', '', line)}")
+    add("")
+
+    add("[顯示交棒 / 黑畫面來源]")
+    for line in display_handoffs() or ["  (無)"]:
+        add(f"  {line}")
+    add("")
+
+    add("[還原時序與停頓]")
+    for line in restore_timing() or ["  (無)"]:
+        add(f"  {line}")
+    add("")
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if REPORT.exists() and REPORT.stat().st_size > MAX_REPORT_BYTES:
+            keep = REPORT.read_text(encoding="utf-8", errors="replace")[-MAX_REPORT_BYTES // 2:]
+            REPORT.write_text(keep, encoding="utf-8")
+        with REPORT.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except OSError as error:
+        print(f"uios-restore-report: cannot write report: {error}", file=sys.stderr)
+        return 1
+    print(f"restore report appended to {REPORT}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

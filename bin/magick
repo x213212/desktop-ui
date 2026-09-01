@@ -1,0 +1,3 @@
+#!/bin/sh
+# ImageMagick 7 command-name compatibility for Ubuntu/Mint's ImageMagick 6.
+exec /usr/bin/convert "$@"

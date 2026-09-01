@@ -1,0 +1,14 @@
+[Unit]
+Description=Quickshell desktop UI
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=30s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/desktop-ui/weather.env
+EnvironmentFile=-%h/.config/desktop-ui/host.env
+ExecStart=%h/.local/bin/qs --no-duplicate -c end4-pC
+Restart=on-failure
+RestartSec=2s

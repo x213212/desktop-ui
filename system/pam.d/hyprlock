@@ -1,0 +1,9 @@
+#%PAM-1.0
+# Dedicated lock-screen stack. PAM authentication is serial, so prompt for the
+# password first and use fingerprint only as a fallback. This prevents typed
+# passwords from being discarded while pam_fprintd waits for its 10-second
+# minimum verification window.
+# Keep this separate from common-auth so unlock does not run login-only modules.
+auth sufficient pam_unix.so nodelay
+auth sufficient pam_fprintd.so max-tries=1 timeout=10
+auth required pam_deny.so

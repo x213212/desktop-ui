@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Toolbar RDP button.
+#
+# One click should land in a working remote session, not in the connection
+# manager.  Two things have to be true for the remote to receive shortcuts:
+# Remmina must be in a fullscreen view mode (only then does it request
+# zwp_keyboard_shortcuts_inhibit from the compositor), and the profile must
+# still say so -- Remmina rewrites the profile from its live window state on
+# exit, so a session that ever ran windowed silently turns the grab off again.
+# Enforce the view mode at launch instead of trusting the file to stay put.
+set -Eeuo pipefail
+
+app_id="org.remmina.Remmina"
+
+# The user desktop override routes rdp:// links and .remmina files here too.
+# Those carry an explicit target, so hand them straight to Remmina's own
+# file-forwarding wrapper instead of applying the toolbar's one-click logic.
+if (( $# > 0 )); then
+    exec /usr/bin/flatpak run --branch=stable --arch=x86_64 \
+        --command=remmina-file-wrapper --file-forwarding "$app_id" @@u "$@" @@
+fi
+host_profile_dir="$HOME/.var/app/$app_id/data/remmina"
+# Flatpak exposes that same path inside the sandbox (verified: XDG_DATA_HOME
+# is ~/.var/app/org.remmina.Remmina/data), so one variable serves both.
+sandbox_profile_dir="$host_profile_dir"
+preference="${XDG_CONFIG_HOME:-$HOME/.config}/uios/remmina-profile"
+manager_title="Remmina Remote Desktop Client"
+# 4 = viewport fullscreen; the only mode in which Remmina grabs the keyboard.
+fullscreen_viewmode=4
+
+# Focus an existing *session* window.  The connection manager shares the app
+# id, so match on the title: focusing the manager would look like a no-op.
+if command -v hyprctl >/dev/null && command -v jq >/dev/null; then
+    address="$(hyprctl clients -j 2>/dev/null \
+        | jq -r --arg cls "$app_id" --arg mgr "$manager_title" \
+            '.[] | select(.class == $cls and .title != $mgr) | .address' \
+        2>/dev/null | head -n 1 || true)"
+    if [[ -n "${address:-}" && "$address" != "null" ]]; then
+        if hyprctl dispatch \
+            "hl.dsp.focus({window=hl.get_window(\"address:${address}\")})" \
+            >/dev/null 2>&1; then
+            exit 0
+        fi
+    fi
+fi
+
+pick_profile() {
+    if [[ -r "$preference" ]]; then
+        local name
+        name="$(head -n 1 "$preference" | tr -d '[:space:]')"
+        if [[ -n "$name" && -f "$host_profile_dir/$name" ]]; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+    fi
+    # Otherwise the single profile, if there is only one.  With several, fall
+    # through to the manager rather than guessing which host is wanted.
+    local -a found=()
+    local path
+    for path in "$host_profile_dir"/*.remmina; do
+        [[ -f "$path" ]] && found+=("$(basename "$path")")
+    done
+    (( ${#found[@]} == 1 )) && printf '%s\n' "${found[0]}"
+}
+
+profile="$(pick_profile || true)"
+
+if [[ -n "${profile:-}" ]]; then
+    file="$host_profile_dir/$profile"
+    if grep -q '^viewmode=' "$file"; then
+        sed -i "s/^viewmode=.*/viewmode=$fullscreen_viewmode/" "$file"
+    else
+        printf 'viewmode=%s\n' "$fullscreen_viewmode" >>"$file"
+    fi
+fi
+
+# The old autostart entry launched Remmina in tray-only mode.  Such an
+# instance consumes a normal launch request without showing a window, so stop
+# it before starting the visible client.
+if flatpak ps --columns=application 2>/dev/null | grep -Fxq "$app_id"; then
+    flatpak kill "$app_id" 2>/dev/null || true
+    sleep 0.2
+fi
+
+if [[ -n "${profile:-}" ]]; then
+    exec /usr/bin/flatpak run "$app_id" --no-tray-icon \
+        -c "$sandbox_profile_dir/$profile"
+fi
+
+exec /usr/bin/flatpak run "$app_id" --no-tray-icon

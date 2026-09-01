@@ -1,0 +1,3 @@
+# Units with an [Install] section that may safely be enabled explicitly.
+uios-restore-report.service
+update-lock-weather.timer

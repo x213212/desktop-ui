@@ -1,0 +1,38 @@
+# command or alternatives separated by |<TAB>reason
+Hyprland	Hyprland compositor
+hyprctl	Hyprland IPC and configuration checks
+hypridle	idle policy
+hyprlock	secure session lock
+hyprsunset	night-light control
+qs|quickshell	Quickshell runtime
+matugen	Material color generation
+python3	UI helper scripts
+systemctl	user service management
+loginctl	logind session actions
+systemd-inhibit	secure suspend/lid flow
+dbus-update-activation-environment	Wayland user-session environment
+jq	JSON processing
+rg	repository portability and credential audit (ripgrep)
+bc	numeric helper scripts
+wl-copy	Wayland clipboard writes
+wl-paste	Wayland clipboard watcher
+cliphist	clipboard history
+grim	screenshots
+slurp	interactive screen-region selection
+wf-recorder	screen recording
+notify-send	desktop notifications
+brightnessctl	backlight control
+wpctl	PipeWire/WirePlumber audio control
+nmcli	NetworkManager control
+bluetoothctl	Bluetooth control
+fuzzel	fallback launcher
+ydotool	synthetic input helper
+hyprpicker	color picker
+identify	ImageMagick image inspection
+convert	ImageMagick 6-compatible image conversion
+gnome-keyring-daemon	secret-service provider; credentials remain external
+fcitx5	input method
+gnome-terminal	configured terminal launcher
+nemo	configured file manager
+fish	configured interactive shell
+cava	audio visualizer data source

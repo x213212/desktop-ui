@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the independent lock-screen weather cache
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/desktop-ui/weather.env
+ExecStart=%h/.local/bin/update-lock-weather
+Nice=10
+IOSchedulingClass=idle
+UMask=0077

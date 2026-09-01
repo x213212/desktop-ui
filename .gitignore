@@ -1,0 +1,75 @@
+# Editor and OS metadata
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Nested source repositories and build products
+shell/end4-pC/.git/
+vendor/**/.git/
+.venv/
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.so
+*.qmlc
+
+# Python/runtime caches
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+runtime/
+.cache/
+.state/
+
+# Local backups, captures and diagnostics
+*.bak
+*.bak-*
+*.backup
+*.orig
+*.rej
+screenshots/
+captures/
+*.log
+
+# Credentials and private integration state. Keep private.example/ tracked.
+private/
+private.local/
+secrets/
+credentials/
+.env
+.env.*
+accounts.conf
+*.keyring
+*.keystore
+*.remmina
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+client_secret*.json
+.netrc
+.npmrc
+.pypirc
+id_rsa
+id_ed25519
+*oauth-token*
+*refresh-token*
+*access-token*
+
+# Generated Quickshell/user state must never become source of truth
+states.json
+todos.json
+notes.json
+chats.json
+notifications.json
+user/generated/
+hypr-session/

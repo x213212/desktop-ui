@@ -1,0 +1,10 @@
+# Exact direct pins derived from the end4-pC dependency snapshot used by this
+# desktop. PyGObject/GnomeDesktop remain distro packages so gi.repository can
+# use the host typelibs. Transitive wheels are resolved by pip for the platform.
+click==8.2.1
+loguru==0.7.3
+materialyoucolor==2.0.10
+numpy==2.2.2
+opencv-contrib-python==4.12.0.88
+pillow==11.1.0
+tqdm==4.67.1

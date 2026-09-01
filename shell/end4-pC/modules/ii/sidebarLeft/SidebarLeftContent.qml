@@ -1,0 +1,145 @@
+import qs
+import qs.services
+import qs.modules.common
+import qs.modules.common.widgets
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Qt5Compat.GraphicalEffects
+import Qt.labs.synchronizer
+
+Item {
+    id: root
+    required property var scopeRoot
+    property int sidebarPadding: 10
+    anchors.fill: parent
+    property bool translatorEnabled: Config.options.sidebar.translator.enable
+    property bool animeEnabled: Config.options.policies.weeb !== 0
+    property bool animeCloset: Config.options.policies.weeb === 2
+    property bool mediaEnabled: Config.options.sidebar.media.enable
+    readonly property bool contentVisible: root.scopeRoot.sidebarOpen
+        || root.scopeRoot.detach || root.scopeRoot.pin
+    property var tabButtonList: [
+        ...(root.translatorEnabled ? [{"icon": "translate", "name": Translation.tr("Translator")}] : []),
+        ...(root.mediaEnabled ? [{"icon": "music_note", "name": Translation.tr("Media")}] : []),
+        ...((root.animeEnabled && !root.animeCloset) ? [{"icon": "bookmark_heart", "name": Translation.tr("Anime")}] : [])
+    ]
+    property int tabCount: swipeView.count
+
+    function focusActiveItem() {
+        swipeView.currentItem.forceActiveFocus()
+    }
+
+    Keys.onPressed: (event) => {
+        if (event.modifiers === Qt.ControlModifier) {
+            if (event.key === Qt.Key_PageDown) {
+                swipeView.incrementCurrentIndex()
+                event.accepted = true;
+            }
+            else if (event.key === Qt.Key_PageUp) {
+                swipeView.decrementCurrentIndex()
+                event.accepted = true;
+            }
+        }
+    }
+
+    ColumnLayout {
+        anchors {
+            fill: parent
+            margins: sidebarPadding
+        }
+        spacing: verticalTabBar.expanded ? -2 : 0
+
+        VerticalTabBar {
+            id: verticalTabBar
+            visible: tabButtonList.length > 0
+            Layout.fillWidth: true
+            tabButtonList: root.tabButtonList
+            currentIndex: swipeView.currentIndex
+            onCurrentIndexChanged: swipeView.currentIndex = currentIndex
+        }
+
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            implicitWidth: swipeView.implicitWidth
+            implicitHeight: swipeView.implicitHeight
+            topLeftRadius: 0
+            bottomLeftRadius: Appearance.rounding.normal
+            topRightRadius: 0
+            bottomRightRadius: Appearance.rounding.normal
+            color: Appearance.colors.colLayer1
+
+            SwipeView { // Content pages
+                id: swipeView
+                anchors.fill: parent
+                spacing: 10
+                currentIndex: verticalTabBar.currentIndex
+
+                clip: true
+                layer.enabled: true
+                layer.effect: OpacityMask {
+                    maskSource: Rectangle {
+                        width: swipeView.width
+                        height: swipeView.height
+                        radius: Appearance.rounding.small
+                    }
+                }
+
+                contentChildren: [
+                    ...(root.translatorEnabled ? [translator.createObject()] : []),
+                    ...(root.mediaEnabled ? [media.createObject()] : []),
+                    ...((root.tabButtonList.length === 0 || (!root.translatorEnabled && root.animeCloset)) ? [placeholder.createObject()] : []),
+                    ...(root.animeEnabled ? [anime.createObject()] : []),
+                ]
+            }
+        }
+
+        Component {
+            id: translator
+            Item {
+                id: translatorPage
+                Loader {
+                    anchors.fill: parent
+                    active: root.contentVisible && translatorPage.SwipeView.isCurrentItem
+                    asynchronous: true
+                    sourceComponent: Translator {}
+                }
+            }
+        }
+        Component {
+            id: media
+            Item {
+                id: mediaPage
+                Loader {
+                    anchors.fill: parent
+                    active: root.contentVisible && mediaPage.SwipeView.isCurrentItem
+                    asynchronous: true
+                    sourceComponent: SidebarPlayerControl {}
+                }
+            }
+        }
+        Component {
+            id: anime
+            Item {
+                id: animePage
+                Loader {
+                    anchors.fill: parent
+                    active: root.contentVisible && animePage.SwipeView.isCurrentItem
+                    asynchronous: true
+                    sourceComponent: Anime {}
+                }
+            }
+        }
+        Component {
+            id: placeholder
+            Item {
+                StyledText {
+                    anchors.centerIn: parent
+                    text: root.animeCloset ? Translation.tr("Nothing") : Translation.tr("Enjoy your empty sidebar...")
+                    color: Appearance.colors.colSubtext
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,6 @@
+# import<TAB>provider hint
+gi	Ubuntu/Mint: python3-gi + gir1.2-gnomedesktop-4.0
+PIL	manifests/python-requirements.lock (Pillow)
+materialyoucolor	manifests/python-requirements.lock
+numpy	manifests/python-requirements.lock
+cv2	manifests/python-requirements.lock (opencv-contrib-python)

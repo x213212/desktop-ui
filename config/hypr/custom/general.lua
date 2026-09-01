@@ -1,0 +1,2 @@
+-- Host-specific input devices belong here. This mutable seed intentionally
+-- stays generic; see private.example/hypr/general.lua in the repository.

@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply keyboard backlight off after desktop startup
+
+[Timer]
+OnBootSec=15s
+AccuracySec=1s
+Unit=keyboard-backlight-off.service
+
+[Install]
+WantedBy=timers.target

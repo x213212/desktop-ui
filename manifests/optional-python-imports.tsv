@@ -1,0 +1,6 @@
+# import<TAB>feature/provider hint
+click	thumbnail generator CLI
+loguru	thumbnail generator logging
+tqdm	thumbnail generator progress
+dbus	Ubuntu/Mint: python3-dbus; legacy helper compatibility
+Xlib	Ubuntu/Mint: python3-xlib; Xwayland helper compatibility

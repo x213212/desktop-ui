@@ -1,0 +1,10 @@
+# package<TAB>optional feature. Informational only.
+swappy	screenshot annotation
+ffmpeg	media conversion
+mpv	video playback helper
+playerctl	MPRIS CLI
+socat	IPC diagnostics
+sassc	theme generation
+python3-dbus	legacy DBus Python helpers
+python3-xlib	Xwayland Python helpers
+gnome-online-accounts-gtk	Google integration UI; account state is not tracked
